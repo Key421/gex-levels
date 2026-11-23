@@ -1,0 +1,538 @@
+// Daily GEX Levels — paste the string from gex_page.py into "Paste levels".
+// Format: @YYYY-MM-DDTHHMM,price:Label:gex,price:Label:gex,...   (commas or new lines)
+//   @date  → optional (time part optional too); enables the stale-levels warning
+//   gex    → optional net GEX in $mn; scales line thickness
+// Labels containing "Call", "Put", "Zero"/"Flip" are walls / zero gamma; anything else is a
+// +GEX or −GEX strike (a "-" in the label means negative).
+// Alerts: create an alert on this indicator and choose "Any alert() function call".
+
+//@version=6
+indicator("Daily GEX Levels", shorttitle = "GEX", overlay = true, max_lines_count = 100, max_labels_count = 100, max_boxes_count = 100)
+
+// ───────────────────────── Inputs ─────────────────────────
+G_IN = "Levels"
+lvlStr = input.text_area("@2026-11-02T0946,21150:Call Wall:2100,20350:Put Wall:-1400,20825:Zero Gamma:0,21200:GEX+:1000,20500:GEX-:-950", "Paste levels", group = G_IN)
+
+G_CV = "Index → futures conversion"
+autoBasis = input.bool(true, "Auto basis (chart price − index price)", group = G_CV, tooltip = "Adds the futures premium so index strikes line up on ES/NQ. Overnight the basis holds its last regular-hours value.")
+refSym    = input.symbol("NASDAQ:NDX", "Index the levels came from", group = G_CV, tooltip = "NASDAQ:NDX for NQ/MNQ, SP:SPX for ES/MES.")
+basisN    = input.int(10, "Smooth basis over N bars", 1, 200, group = G_CV, tooltip = "Averages the last N basis readings to remove jitter. 1 = no smoothing.")
+manBasis  = input.float(0.0, "Manual basis (when auto is off)", step = 0.25, group = G_CV)
+roundTick = input.bool(true, "Round converted prices to tick size", group = G_CV)
+
+G_CW = "Call Wall"
+showCall = input.bool(true, "Show", inline = "a", group = G_CW)
+cCall    = input.color(#00E676, "", inline = "a", group = G_CW)
+wCall    = input.int(3, "Width", 1, 10, inline = "a", group = G_CW)
+sCall    = input.string("Solid", "", ["Solid", "Dashed", "Dotted"], inline = "a", group = G_CW)
+nCall    = input.string("CALL WALL", "Label name", group = G_CW)
+
+G_PW = "Put Wall"
+showPut = input.bool(true, "Show", inline = "a", group = G_PW)
+cPut    = input.color(#FF1744, "", inline = "a", group = G_PW)
+wPut    = input.int(3, "Width", 1, 10, inline = "a", group = G_PW)
+sPut    = input.string("Solid", "", ["Solid", "Dashed", "Dotted"], inline = "a", group = G_PW)
+nPut    = input.string("PUT WALL", "Label name", group = G_PW)
+
+G_ZG = "Zero Gamma"
+showZero = input.bool(true, "Show", inline = "a", group = G_ZG)
+cZero    = input.color(#FFAB00, "", inline = "a", group = G_ZG)
+wZero    = input.int(2, "Width", 1, 10, inline = "a", group = G_ZG)
+sZero    = input.string("Dashed", "", ["Solid", "Dashed", "Dotted"], inline = "a", group = G_ZG)
+nZero    = input.string("ZERO GAMMA", "Label name", group = G_ZG)
+
+G_OT = "Other GEX strikes"
+showOther = input.bool(true, "Show", inline = "a", group = G_OT)
+cPos      = input.color(#26C6DA, "+", inline = "a", group = G_OT)
+cNeg      = input.color(#E040FB, "−", inline = "a", group = G_OT)
+wOther    = input.int(1, "Width", 1, 10, inline = "a", group = G_OT)
+sOther    = input.string("Dotted", "", ["Solid", "Dashed", "Dotted"], inline = "a", group = G_OT)
+nPos      = input.string("+GEX", "Positive name", inline = "n", group = G_OT)
+nNeg      = input.string("−GEX", "Negative name", inline = "n", group = G_OT)
+
+G_LN = "Lines"
+extMode   = input.string("Full chart", "Line extent", ["Full chart", "From today's open", "Right of price only"], group = G_LN)
+scaleOn   = input.bool(true, "Thicker lines for bigger GEX", group = G_LN, tooltip = "Uses the GEX number in the pasted string. The largest level gets the full extra width.")
+scaleMax  = input.int(4, "Max extra width from GEX size", 0, 8, group = G_LN)
+hlNearest = input.bool(true, "Highlight the level nearest price", group = G_LN)
+hlBoost   = input.int(2, "Highlight extra width", 0, 6, group = G_LN)
+
+G_LB = "Labels"
+showLbl    = input.bool(true, "Show labels", group = G_LB)
+lblPos     = input.string("Right", "Position", ["Right", "Left (line start)"], group = G_LB)
+lblOff     = input.int(4, "Right offset (bars)", 0, 200, group = G_LB)
+lblSize    = input.string("Normal", "Size", ["Tiny", "Small", "Normal", "Large", "Huge"], group = G_LB)
+lblStyle   = input.string("Filled tag", "Style", ["Filled tag", "Text only"], group = G_LB)
+lblTransp  = input.int(15, "Tag transparency", 0, 100, group = G_LB)
+autoTxt    = input.bool(true, "Auto text contrast", inline = "t", group = G_LB)
+lblTxtCol  = input.color(color.white, "else", inline = "t", group = G_LB)
+showIdxPx  = input.bool(true, "Show index strike", group = G_LB)
+showFutPx  = input.bool(true, "Show converted chart price", group = G_LB)
+showGex    = input.bool(true, "Show GEX size", group = G_LB)
+showDist   = input.bool(true, "Show distance from current price", group = G_LB)
+upperLbl   = input.bool(false, "Force UPPERCASE", group = G_LB)
+
+G_ZN = "Zones"
+showZone   = input.bool(true, "Shade a zone around levels", group = G_ZN)
+zoneMajor  = input.bool(true, "Walls & zero gamma only", group = G_ZN)
+zoneMode   = input.string("Points", "Zone width in", ["Points", "ATR multiple"], group = G_ZN)
+zonePts    = input.float(2.0, "Half-width (points)", minval = 0, step = 0.25, group = G_ZN)
+zoneAtr    = input.float(0.25, "Half-width (× ATR 14)", minval = 0, step = 0.05, group = G_ZN)
+zoneTransp = input.int(85, "Zone transparency", 0, 100, group = G_ZN)
+
+G_RG = "Gamma regime"
+regMode  = input.string("Today", "Tint background above / below zero gamma", ["Today", "Last N bars", "Off"], group = G_RG)
+regFromH = input.int(9, "Today starts at", 0, 23, inline = "f", group = G_RG)
+regFromM = input.int(30, ":", 0, 59, inline = "f", group = G_RG)
+regBars  = input.int(300, "N bars (Last N bars mode)", 1, 5000, group = G_RG)
+cRegPos  = input.color(color.new(#00E676, 93), "Above (positive γ)", inline = "r", group = G_RG)
+cRegNeg  = input.color(color.new(#FF1744, 93), "Below (negative γ)", inline = "r", group = G_RG)
+
+G_TB = "Summary table"
+showTbl = input.bool(true, "Show table", group = G_TB)
+tblPos  = input.string("Top Right", "Position", ["Top Right", "Top Left", "Middle Right", "Bottom Right", "Bottom Left"], group = G_TB)
+tblSize = input.string("Small", "Text size", ["Tiny", "Small", "Normal", "Large"], group = G_TB)
+tblBg   = input.color(color.new(#131722, 5), "Background", inline = "c", group = G_TB)
+tblTxt  = input.color(color.white, "Text", inline = "c", group = G_TB)
+
+G_LR = "Live read panel"
+showLive = input.bool(true, "Show live read panel", group = G_LR, tooltip = "Plain-language read of the regime, where price sits, what usually works there, and cautions.")
+livePos  = input.string("Bottom Right", "Position", ["Bottom Right", "Top Right", "Top Left", "Middle Right", "Bottom Left"], group = G_LR)
+liveSize = input.string("Small", "Text size", ["Tiny", "Small", "Normal", "Large"], group = G_LR)
+proxPct  = input.float(0.15, "“Near” a level = within % of price", minval = 0.01, step = 0.05, group = G_LR)
+newsDay  = input.bool(false, "News / event day (CPI, FOMC, NFP…)", group = G_LR, tooltip = "Tick this on big news days to add a caution that levels break more easily.")
+alZone   = input.bool(true, "Alert when price reaches / breaks a wall or the pivot", group = G_LR)
+
+G_TM = "Schedule, reminder & stale check"
+tz        = input.string("America/New_York", "Time zone", group = G_TM, tooltip = "America/New_York follows EST/EDT automatically. Runs are weekdays only.")
+r1On      = input.bool(true, "Pre-market run", inline = "r1", group = G_TM)
+r1H       = input.int(8, "", 0, 23, inline = "r1", group = G_TM)
+r1M       = input.int(30, ":", 0, 59, inline = "r1", group = G_TM)
+r2On      = input.bool(true, "Open run", inline = "r2", group = G_TM)
+r2H       = input.int(9, "", 0, 23, inline = "r2", group = G_TM)
+r2M       = input.int(46, ":", 0, 59, inline = "r2", group = G_TM)
+r3On      = input.bool(true, "Midday run", inline = "r3", group = G_TM)
+r3H       = input.int(12, "", 0, 23, inline = "r3", group = G_TM)
+r3M       = input.int(30, ":", 0, 59, inline = "r3", group = G_TM)
+alRemind  = input.bool(true, "Send an alert at each run time", group = G_TM)
+remWin    = input.int(30, "Show 'update' banner for (minutes)", 5, 240, group = G_TM)
+staleWarn = input.bool(true, "Warn when pasted levels are out of date", group = G_TM, tooltip = "Uses the @date/time at the start of the string. Levels older than the latest run show an 'UPDATE' banner, then a red 'STALE' warning once the banner window ends. Before today's first run, prior-day levels show in amber.")
+
+G_AL = "Alerts (use “Any alert() function call”)"
+alCross   = input.bool(true, "Price crosses a level", group = G_AL)
+alNear    = input.bool(false, "Price comes within", inline = "n", group = G_AL)
+alNearPts = input.float(5.0, "points of a level", minval = 0, step = 0.25, inline = "n", group = G_AL)
+alRegime  = input.bool(true, "Gamma regime flips", group = G_AL)
+
+// ───────────────────────── Helpers ─────────────────────────
+f_type(string s) =>
+    string u = str.upper(s)
+    str.contains(u, "CALL") ? 0 : str.contains(u, "PUT") ? 1 : (str.contains(u, "ZERO") or str.contains(u, "FLIP")) ? 2 : str.contains(u, "-") ? 4 : 3
+
+f_show(int t) =>
+    t == 0 ? showCall : t == 1 ? showPut : t == 2 ? showZero : showOther
+
+f_col(int t) =>
+    switch t
+        0 => cCall
+        1 => cPut
+        2 => cZero
+        3 => cPos
+        => cNeg
+
+f_width(int t) =>
+    t == 0 ? wCall : t == 1 ? wPut : t == 2 ? wZero : wOther
+
+f_lstyle(string s) =>
+    s == "Dashed" ? line.style_dashed : s == "Dotted" ? line.style_dotted : line.style_solid
+
+f_style(int t) =>
+    f_lstyle(t == 0 ? sCall : t == 1 ? sPut : t == 2 ? sZero : sOther)
+
+f_name(int t) =>
+    switch t
+        0 => nCall
+        1 => nPut
+        2 => nZero
+        3 => nPos
+        => nNeg
+
+f_size(string s) =>
+    switch s
+        "Tiny"  => size.tiny
+        "Small" => size.small
+        "Large" => size.large
+        "Huge"  => size.huge
+        => size.normal
+
+f_pos(string s) =>
+    switch s
+        "Top Left"     => position.top_left
+        "Middle Right" => position.middle_right
+        "Bottom Right" => position.bottom_right
+        "Bottom Left"  => position.bottom_left
+        => position.top_right
+
+f_contrast(color c) =>
+    (color.r(c) * 0.299 + color.g(c) * 0.587 + color.b(c) * 0.114) > 150 ? color.black : color.white
+
+f_signed(float d) =>
+    (d >= 0 ? "+" : "") + str.tostring(d, format.mintick)
+
+f_gexStr(float m) =>
+    na(m) ? "" : (m >= 0 ? "+" : "−") + (math.abs(m) >= 1000 ? str.tostring(math.abs(m) / 1000, "#.##") + "B" : str.tostring(math.abs(m), "#") + "M")
+
+// ───────────────────────── Parse levels (once) ─────────────────────────
+var array<float> lvP = array.new<float>()
+var array<int>   lvT = array.new<int>()
+var array<float> lvM = array.new<float>()
+var float zgIdx     = na
+var float cwIdx     = na
+var float pwIdx     = na
+var float maxMag    = 0.0
+var int   lvDateKey = 0
+var int   lvHM      = -1
+
+if barstate.isfirst
+    for raw in str.split(str.replace_all(lvlStr, "\n", ","), ",")
+        item = str.replace_all(raw, " ", "")
+        if str.startswith(item, "@")
+            dt = str.split(str.substring(item, 1), "T")
+            if dt.size() > 1 and str.length(dt.get(1)) >= 4
+                float hm = str.tonumber(str.substring(dt.get(1), 0, 4))
+                if not na(hm)
+                    lvHM := math.round(hm)
+            dp = str.split(dt.get(0), "-")
+            if dp.size() == 3
+                float yy = str.tonumber(dp.get(0))
+                float mm = str.tonumber(dp.get(1))
+                float dd = str.tonumber(dp.get(2))
+                if not na(yy) and not na(mm) and not na(dd)
+                    lvDateKey := math.round(yy) * 10000 + math.round(mm) * 100 + math.round(dd)
+        else
+            parts = str.split(item, ":")
+            if parts.size() > 0
+                float p0 = str.tonumber(parts.get(0))
+                if not na(p0)
+                    int   t = f_type(parts.size() > 1 ? parts.get(1) : "")
+                    float m = parts.size() > 2 ? str.tonumber(parts.get(2)) : na
+                    lvP.push(p0)
+                    lvT.push(t)
+                    lvM.push(m)
+                    if t == 2 and na(zgIdx)
+                        zgIdx := p0
+                    if t == 0 and na(cwIdx)
+                        cwIdx := p0
+                    if t == 1 and na(pwIdx)
+                        pwIdx := p0
+                    if t != 2 and not na(m)
+                        maxMag := math.max(maxMag, math.abs(m))
+
+f_extraW(int i) =>
+    float m = lvM.get(i)
+    scaleOn and lvT.get(i) != 2 and not na(m) and maxMag > 0 ? math.round(math.abs(m) / maxMag * scaleMax) : 0
+
+// ───────────────────────── Basis (smoothed) ─────────────────────────
+idx = request.security(refSym, timeframe.period, close, gaps = barmerge.gaps_on, ignore_invalid_symbol = true)
+var array<float> bSamp = array.new<float>()
+var float basis = na
+if not autoBasis
+    basis := manBasis
+else if not na(idx)
+    bSamp.push(close - idx)
+    if bSamp.size() > basisN
+        bSamp.shift()
+    basis := bSamp.avg()
+b = nz(basis)
+
+conv(float p0) =>
+    roundTick ? math.round_to_mintick(p0 + b) : p0 + b
+
+atr = ta.atr(14)
+zw  = zoneMode == "Points" ? zonePts : zoneAtr * atr
+
+var int dayStart = 0
+if timeframe.change("D")
+    dayStart := bar_index
+
+// ───────────────────────── Time, reminder & stale check ─────────────────────────
+nowY     = year(timenow, tz)
+nowMo    = month(timenow, tz)
+nowD     = dayofmonth(timenow, tz)
+nowDow   = dayofweek(timenow, tz)
+isWkday  = nowDow != dayofweek.saturday and nowDow != dayofweek.sunday
+todayKey = nowY * 10000 + nowMo * 100 + nowD
+tintFrom = timestamp(tz, nowY, nowMo, nowD, regFromH, regFromM)
+
+// Latest scheduled run that has already passed today
+t1 = timestamp(tz, nowY, nowMo, nowD, r1H, r1M)
+t2 = timestamp(tz, nowY, nowMo, nowD, r2H, r2M)
+t3 = timestamp(tz, nowY, nowMo, nowD, r3H, r3M)
+int    lastRun  = na
+string lastName = ""
+if r1On and timenow >= t1 and (na(lastRun) or t1 > lastRun)
+    lastRun  := t1
+    lastName := "PRE-MARKET"
+if r2On and timenow >= t2 and (na(lastRun) or t2 > lastRun)
+    lastRun  := t2
+    lastName := "OPEN"
+if r3On and timenow >= t3 and (na(lastRun) or t3 > lastRun)
+    lastRun  := t3
+    lastName := "MIDDAY"
+hasRun = isWkday and not na(lastRun)
+
+// When the pasted levels were pulled (midnight if the string has a date but no time)
+hasDate = lvDateKey > 0
+lvTime  = hasDate ? timestamp(tz, math.floor(lvDateKey / 10000), math.floor((lvDateKey % 10000) / 100), lvDateKey % 100, lvHM >= 0 ? math.floor(lvHM / 100) : 0, lvHM >= 0 ? lvHM % 100 : 0) : na
+outdated = hasRun and (not hasDate or lvTime < lastRun)
+inWindow = hasRun and timenow < lastRun + remWin * 60000
+
+remActive = outdated and inWindow
+staleRed  = staleWarn and hasDate and outdated and not inWindow
+priorDay  = staleWarn and hasDate and isWkday and na(lastRun) and lvDateKey != todayKey
+dateStr   = hasDate ? str.tostring(math.floor((lvDateKey % 10000) / 100)) + "/" + str.tostring(lvDateKey % 100) + (lvHM >= 0 ? " " + str.format("{0,number,00}:{1,number,00}", math.floor(lvHM / 100), lvHM % 100) : "") : ""
+
+varip int remFiredFor = 0
+if barstate.isrealtime and alRemind and hasRun and inWindow and remFiredFor != lastRun
+    remFiredFor := lastRun
+    alert("⟳ " + lastName + " run: update GEX levels (" + syminfo.ticker + "). Copy the new string from the GEX page and paste it into the indicator.", alert.freq_once_per_bar)
+
+// ───────────────────────── Regime ─────────────────────────
+zgF     = na(zgIdx) ? na : conv(zgIdx)
+hasZg   = not na(zgF)
+prev    = close[1]
+posNow  = hasZg and close >= zgF
+posPrev = hasZg and prev >= zgF
+
+// ───────────────────────── Live read: where is price? ─────────────────────────
+cwF  = na(cwIdx) ? na : conv(cwIdx)
+pwF  = na(pwIdx) ? na : conv(pwIdx)
+prox = close * proxPct / 100
+// 0 mid-range · 1 above call wall · 2 near call wall · 3 at zero γ · 4 near put wall · 5 below put wall
+zone = not na(cwF) and close > cwF + prox ? 1 : not na(pwF) and close < pwF - prox ? 5 : not na(cwF) and math.abs(close - cwF) <= prox ? 2 : not na(pwF) and math.abs(close - pwF) <= prox ? 4 : hasZg and math.abs(close - zgF) <= prox ? 3 : 0
+
+f_playTitle(bool pos, int z) =>
+    switch z
+        1 => "Above the call wall"
+        2 => pos ? "Call wall overhead · positive γ" : "Call wall overhead · negative γ"
+        3 => "At the zero-gamma pivot"
+        4 => pos ? "Put wall support · positive γ" : "Put wall · negative γ"
+        5 => "Below the put wall"
+        => pos ? "Positive γ · mid-range" : "Negative γ · mid-range"
+
+f_playBody(bool pos, int z) =>
+    switch z
+        1 => "Extension territory — moves are often stretched.\nTighten long stops; watch for a failed breakout."
+        2 => pos ? "Rallies tend to stall here.\nLook for rejection to fade, or take profits." : "Squeezes can run through the wall.\nRespect momentum; don't short just the level."
+        3 => "A cross can flip chop into trend.\nWait for price to hold one side first."
+        4 => pos ? "Dips tend to get bought here.\nLook for a hold; stop just under the wall." : "A clean break can accelerate.\nDon't assume support holds."
+        5 => "Downside acceleration territory.\nA reclaim of the wall is the reversal tell."
+        => pos ? "Expect chop and mean reversion.\nFade moves toward the walls; don't chase." : "Moves tend to extend. Trade with momentum,\ngive stops room, consider smaller size."
+
+f_zoneName(int z) =>
+    switch z
+        1 => "broke ABOVE the call wall"
+        2 => "is near the call wall"
+        3 => "is at the zero-gamma pivot"
+        4 => "is near the put wall"
+        5 => "broke BELOW the put wall"
+        => "is mid-range"
+
+if barstate.isrealtime and alZone and zone != zone[1] and zone != 0
+    alert(syminfo.ticker + " " + f_zoneName(zone) + " (" + str.tostring(close, format.mintick) + ") · " + f_playTitle(hasZg ? posNow : true, zone), alert.freq_once_per_bar)
+inTint  = regMode == "Today" ? time >= tintFrom : regMode == "Last N bars" ? bar_index > last_bar_index - regBars : false
+
+bgcolor(hasZg and inTint ? (posNow ? cRegPos : cRegNeg) : na, title = "Gamma regime")
+
+// ───────────────────────── Level alerts ─────────────────────────
+if barstate.isrealtime and lvP.size() > 0
+    for i = 0 to lvP.size() - 1
+        t = lvT.get(i)
+        if f_show(t)
+            p  = conv(lvP.get(i))
+            nm = f_name(t) + " " + str.tostring(lvP.get(i)) + " (" + str.tostring(p, format.mintick) + ")"
+            if alCross and ((prev < p and close >= p) or (prev > p and close <= p))
+                alert(syminfo.ticker + " crossed " + nm, alert.freq_once_per_bar)
+            if alNear and math.abs(close - p) <= alNearPts and math.abs(prev - p) > alNearPts
+                alert(syminfo.ticker + " within " + str.tostring(alNearPts) + " pts of " + nm, alert.freq_once_per_bar)
+    if alRegime and hasZg and posNow != posPrev
+        alert(syminfo.ticker + (posNow ? " moved ABOVE zero gamma → positive gamma" : " moved BELOW zero gamma → negative gamma"), alert.freq_once_per_bar)
+
+// ───────────────────────── Drawing ─────────────────────────
+var array<line>  lns = array.new<line>()
+var array<label> lbs = array.new<label>()
+var array<box>   bxs = array.new<box>()
+
+if barstate.islast
+    for x in lns
+        x.delete()
+    for x in lbs
+        x.delete()
+    for x in bxs
+        x.delete()
+    lns.clear()
+    lbs.clear()
+    bxs.clear()
+
+    n = lvP.size()
+    if n > 0
+        int nearI = -1
+        float bestD = na
+        for i = 0 to n - 1
+            if f_show(lvT.get(i))
+                d = math.abs(close - conv(lvP.get(i)))
+                if na(bestD) or d < bestD
+                    bestD := d
+                    nearI := i
+
+        x1    = extMode == "Full chart" ? bar_index - 1 : extMode == "From today's open" ? dayStart : bar_index
+        ext   = extMode == "Full chart" ? extend.both : extend.right
+        xLeft = extMode == "Right of price only" ? bar_index : dayStart
+
+        for i = 0 to n - 1
+            t = lvT.get(i)
+            if not f_show(t)
+                continue
+            p0   = lvP.get(i)
+            p    = conv(p0)
+            m    = lvM.get(i)
+            col  = f_col(t)
+            near = hlNearest and i == nearI
+            w    = math.min(f_width(t) + f_extraW(i) + (near ? hlBoost : 0), 12)
+
+            lns.push(line.new(x1, p, bar_index, p, color = col, width = w, style = f_style(t), extend = ext))
+
+            if showZone and (not zoneMajor or t <= 2) and zw > 0
+                bxs.push(box.new(x1, p + zw, bar_index, p - zw, border_color = color.new(col, 100), border_width = 0, bgcolor = color.new(col, near ? math.max(zoneTransp - 10, 0) : zoneTransp), extend = ext))
+
+            if showLbl
+                string txt = (near ? "► " : "") + f_name(t)
+                if showIdxPx
+                    txt += "  " + str.tostring(p0)
+                if showFutPx and (b != 0 or not showIdxPx)
+                    txt += (showIdxPx ? "  ▸ " : "  ") + str.tostring(p, format.mintick)
+                if showGex and t != 2 and not na(m)
+                    txt += "  [" + f_gexStr(m) + "]"
+                if showDist
+                    txt += "  (" + f_signed(p - close) + ")"
+                if upperLbl
+                    txt := str.upper(txt)
+
+                isTag  = lblStyle == "Filled tag"
+                isLeft = lblPos != "Right"
+                tagCol = color.new(col, near ? 0 : lblTransp)
+                tip    = f_name(t) + "\nIndex strike: " + str.tostring(p0) + "\nOn this chart: " + str.tostring(p, format.mintick) + (na(m) or t == 2 ? "" : "\nGEX: " + f_gexStr(m) + " per 1%") + "\nBasis: " + f_signed(b) + "\nDistance: " + f_signed(p - close)
+
+                lbs.push(label.new(isLeft ? xLeft : bar_index + lblOff, p, txt,
+                     color     = isTag ? tagCol : color.new(col, 100),
+                     style     = isTag ? (isLeft ? label.style_label_right : label.style_label_left) : label.style_none,
+                     textcolor = isTag ? (autoTxt ? f_contrast(col) : lblTxtCol) : col,
+                     size      = f_size(lblSize),
+                     tooltip   = tip))
+
+    // Status banner above price: reminder first, then stale warning
+    if remActive or staleRed
+        string bTxt = remActive ? "⟳ UPDATE GEX LEVELS · " + lastName : "⚠ STALE GEX LEVELS (" + dateStr + ")"
+        color  bCol = remActive ? cZero : cPut
+        lbs.push(label.new(bar_index + lblOff, high + atr * 2, bTxt, color = bCol, style = label.style_label_down, textcolor = f_contrast(bCol), size = size.large, tooltip = "Run gex_page.py and paste the new levels string."))
+
+// ───────────────────────── Summary table ─────────────────────────
+var table tbl = table.new(f_pos(tblPos), 5, 28, bgcolor = tblBg, frame_color = color.new(color.gray, 50), frame_width = 1, border_color = color.new(color.gray, 75), border_width = 1)
+
+f_fullRow(int r, string txt, color txtCol, color bg, string sz) =>
+    table.cell(tbl, 0, r, txt, text_color = txtCol, text_size = sz, text_halign = text.align_left, bgcolor = bg)
+    for c = 1 to 4
+        table.cell(tbl, c, r, "", bgcolor = bg)
+
+f_priceRow(int r, string sz) =>
+    f_fullRow(r, "► PRICE", tblTxt, color.new(color.gray, 70), sz)
+    table.cell(tbl, 2, r, str.tostring(close, format.mintick), text_color = tblTxt, text_size = sz, bgcolor = color.new(color.gray, 70))
+
+if showTbl and barstate.islast
+    table.clear(tbl, 0, 0, 4, 27)
+    sz = f_size(tblSize)
+    table.cell(tbl, 0, 0, "GEX LEVEL" + (hasDate ? "  " + dateStr : ""), text_color = tblTxt, text_size = sz, text_halign = text.align_left)
+    table.cell(tbl, 1, 0, "INDEX", text_color = tblTxt, text_size = sz)
+    table.cell(tbl, 2, 0, "CHART", text_color = tblTxt, text_size = sz)
+    table.cell(tbl, 3, 0, "GEX", text_color = tblTxt, text_size = sz)
+    table.cell(tbl, 4, 0, "DIST", text_color = tblTxt, text_size = sz)
+
+    int r = 1
+    bool priceDone = false
+    if lvP.size() > 0
+        for j in lvP.sort_indices(order.descending)
+            if r > 22
+                break
+            t = lvT.get(j)
+            if not f_show(t)
+                continue
+            p0 = lvP.get(j)
+            p  = conv(p0)
+            m  = lvM.get(j)
+            if not priceDone and close > p
+                f_priceRow(r, sz)
+                r += 1
+                priceDone := true
+            d = p - close
+            table.cell(tbl, 0, r, f_name(t), text_color = f_col(t), text_size = sz, text_halign = text.align_left)
+            table.cell(tbl, 1, r, str.tostring(p0), text_color = tblTxt, text_size = sz)
+            table.cell(tbl, 2, r, str.tostring(p, format.mintick), text_color = tblTxt, text_size = sz)
+            table.cell(tbl, 3, r, t == 2 ? "—" : f_gexStr(m), text_color = na(m) or t == 2 ? tblTxt : m >= 0 ? cCall : cPut, text_size = sz)
+            table.cell(tbl, 4, r, f_signed(d), text_color = d >= 0 ? cCall : cPut, text_size = sz)
+            r += 1
+    if not priceDone
+        f_priceRow(r, sz)
+        r += 1
+    if hasZg
+        table.cell(tbl, 0, r, "REGIME", text_color = tblTxt, text_size = sz, text_halign = text.align_left)
+        table.cell(tbl, 1, r, posNow ? "Positive γ" : "Negative γ", text_color = posNow ? cCall : cPut, text_size = sz)
+        table.cell(tbl, 2, r, "", text_size = sz)
+        table.cell(tbl, 3, r, "Basis", text_color = tblTxt, text_size = sz)
+        table.cell(tbl, 4, r, f_signed(b), text_color = tblTxt, text_size = sz)
+        r += 1
+    if remActive
+        f_fullRow(r, "⟳ UPDATE LEVELS · " + lastName, f_contrast(cZero), cZero, sz)
+        r += 1
+    if staleRed
+        f_fullRow(r, "⚠ STALE LEVELS (" + dateStr + ")", f_contrast(cPut), cPut, sz)
+        r += 1
+    else if priorDay
+        f_fullRow(r, "Prior-day levels (" + dateStr + ")", f_contrast(cZero), color.new(cZero, 40), sz)
+        r += 1
+
+// ───────────────────────── Live read panel ─────────────────────────
+var table liveTbl = table.new(f_pos(livePos), 1, 5, bgcolor = tblBg, frame_color = color.new(color.gray, 50), frame_width = 1, border_color = color.new(color.gray, 75), border_width = 1)
+
+if showLive and barstate.islast
+    table.clear(liveTbl, 0, 0, 0, 4)
+    lsz  = f_size(liveSize)
+    pos  = hasZg ? posNow : true
+    rCol = hasZg ? (posNow ? cCall : cPut) : color.gray
+
+    string head = hasZg ? (posNow ? "▲ POSITIVE GAMMA" : "▼ NEGATIVE GAMMA") + "   " + f_signed(close - zgF) + " vs zero γ" : "LIVE READ · no zero gamma in levels"
+    table.cell(liveTbl, 0, 0, head, text_color = f_contrast(rCol), bgcolor = color.new(rCol, 15), text_size = lsz, text_halign = text.align_left)
+    table.cell(liveTbl, 0, 1, f_playTitle(pos, zone), text_color = tblTxt, bgcolor = color.new(color.gray, 70), text_size = lsz, text_halign = text.align_left)
+    table.cell(liveTbl, 0, 2, f_playBody(pos, zone), text_color = tblTxt, text_size = lsz, text_halign = text.align_left)
+
+    string dist = ""
+    if not na(cwF)
+        dist += "Call " + f_signed(cwF - close)
+    if hasZg
+        dist += (dist == "" ? "" : "   ·   ") + "Zero γ " + f_signed(zgF - close)
+    if not na(pwF)
+        dist += (dist == "" ? "" : "   ·   ") + "Put " + f_signed(pwF - close)
+    table.cell(liveTbl, 0, 3, dist, text_color = tblTxt, text_size = lsz, text_halign = text.align_left)
+
+    string warn = ""
+    if isWkday and nowDow == dayofweek.friday and nowD >= 15 and nowD <= 21
+        warn += "⚠ Monthly OPEX — gamma rolls off; levels can lose grip."
+    if newsDay
+        warn += (warn == "" ? "" : "\n") + "⚠ News day — levels break more easily."
+    if isWkday and hour(timenow, tz) == 15
+        warn += (warn == "" ? "" : "\n") + "⚠ Last hour — same-day gamma decays fast."
+    if remActive or staleRed
+        warn += (warn == "" ? "" : "\n") + "⚠ Levels out of date — paste a fresh string."
+    if warn != ""
+        table.cell(liveTbl, 0, 4, warn, text_color = f_contrast(cZero), bgcolor = color.new(cZero, 25), text_size = lsz, text_halign = text.align_left)
+    else
+        table.cell(liveTbl, 0, 4, "Context, not a signal — confirm with price action.", text_color = color.new(tblTxt, 40), text_size = lsz, text_halign = text.align_left)

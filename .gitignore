@@ -1,0 +1,9 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# Personal run log (levels history) — keep local
+gex_log.db
+
+# Scratch notes
+New Text Document.txt
